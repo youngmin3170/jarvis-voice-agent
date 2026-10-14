@@ -15,10 +15,8 @@ load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 MODEL_FLASH = "gemini-3.5-flash-lite"
-MODEL_PRO = "gemini-pro-latest"
 
 # Load system instructions from prompt.md if it exists
-system_prompt = "You are J.A.R.V.I.S., a helpful and concise AI assistant."
 if os.path.exists("prompt.md"):
     with open("prompt.md", "r", encoding="utf-8") as f:
         system_prompt = f.read()
@@ -36,12 +34,12 @@ print("J.A.R.V.I.S. Online. Modular Architecture Active.")
 print("-" * 60)
 
 while True:
-    # 1. Standby Mode: Wait for "Hey Jarvis"
+    # Standby Mode: Wait for "Hey Jarvis"
     wait_for_wake_word()
 
     speak("Yes, sir?")
     
-    # 2. Active Session Mode: Keep listening for follow-up questions
+    # Active Session Mode: Keep listening for follow-up questions
     while True:
         user_query = transcribe_speech()
 

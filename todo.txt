@@ -1,0 +1,10 @@
+1. llm model is too restricted. try to use one with higher limit for free plan
+2. can we split the work by having multiple agents?
+3. add more tools for function calling like gmail or calendar or etc.
+4. can we get accurate gps location? not like city wise like gu wise.
+5. right now, the voice.py leaves mp3 or audio file in os temp directory when i do ctrl+c or interrupt it.
+worrying about the unhandled garbage. maybe i am wrong. i can't guarantee that's how it behaves rn.
+3) i need to add interrupt feature in case it didn't understand correctly.
+Do You Have to Say "Hey Jarvis" Every Single Time?
+Industry Standard: Follow-up / Active Session Mode.
+ML Automatically Detect Speech Pauses

@@ -5,6 +5,8 @@ import edge_tts
 from elevenlabs.client import ElevenLabs
 from utils import get_temp_audio_path
 
+pygame.mixer.init()
+
 def speak(text: str):
     """
     Primary: ElevenLabs
@@ -31,7 +33,11 @@ def speak(text: str):
             
             _save_and_play_eleven_audio(audio_stream)
             return
-            
+
+        except KeyboardInterrupt:
+            print("\n[J.A.R.V.I.S.]: Voice generation cancelled by user.")
+            return
+        
         except Exception as e:
             print(f"\n[System Warning]: ElevenLabs out of quota or failed ({e}). Executing fallback...")
             
@@ -44,13 +50,16 @@ def _save_and_play_eleven_audio(audio_generator):
     Helper to save ElevenLabs audio bytes to a temp file and play it.
     """
     temp_path = get_temp_audio_path()
-    
-    with open(temp_path, "wb") as f:
-        for chunk in audio_generator:
-            if chunk:
-                f.write(chunk)
-                
-    _play_file(temp_path)
+
+    try:
+        with open(temp_path, "wb") as f:
+            for chunk in audio_generator:
+                if chunk:
+                    f.write(chunk)
+                    
+        _play_file(temp_path)
+    finally:
+        _safe_delete(temp_path)
 
 
 def _edge_tts_fallback(text: str):
@@ -65,9 +74,15 @@ def _edge_tts_fallback(text: str):
             
         asyncio.run(generate_edge())
         _play_file(temp_path)
-        
+
+    except KeyboardInterrupt:
+        print("\n[J.A.R.V.I.S.]: Speech interrupted by user.")
+
     except Exception as e:
         print(f"[System Error]: Fallback TTS failed: {e}")
+
+    finally:
+        _safe_delete(temp_path)
 
 
 def _play_file(file_path: str):
@@ -80,8 +95,9 @@ def _play_file(file_path: str):
         return
 
     try:
-        # Initialize the pygame mixer silently
-        pygame.mixer.init()
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+
         pygame.mixer.music.load(file_path)
         pygame.mixer.music.play()
         
@@ -89,14 +105,26 @@ def _play_file(file_path: str):
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
             
-        pygame.mixer.music.unload()
-        pygame.mixer.quit()
+    except KeyboardInterrupt:
+        print("\n[J.A.R.V.I.S.]: Speech interrupted! Stopping audio...")
     except Exception as e:
         print(f"[System Error]: Audio playback failed: {e}")
     finally:
         # Clean up the temporary audio file safely
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
         except Exception:
             pass
+
+        _safe_delete(file_path)
+
+
+def _safe_delete(file_path: str):
+    """Deletes a file if it exists, logging a warning if Windows still locks it."""
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except OSError as e:
+            print(f"[System Warning]: Could not delete temp file {file_path}: {e}")
