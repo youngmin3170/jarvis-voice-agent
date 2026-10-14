@@ -1,0 +1,28 @@
+# Environment Variables & Secrets
+.env
+
+# Personal Knowledge Base & Vector Database (Privacy!)
+chroma_db/
+workspace/knowledge_base/*
+!workspace/knowledge_base/.gitkeep
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Audio Temp Files & Custom Wake Word Models
+*.wav
+*.mp3
+# *.onnx
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,23 @@
+# Core Brain & Environment
+google-genai
+python-dotenv
+requests
+
+# Hands & Knowledge Base (RAG)
+ddgs
+chromadb
+sentence-transformers
+pypdf
+
+# Mouth (TTS)
+elevenlabs
+edge-tts
+pygame
+
+# Ears (Wake Word & STT)
+openwakeword
+onnxruntime
+faster-whisper
+SpeechRecognition
+pyaudio
+numpy
