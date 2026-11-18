@@ -40,7 +40,9 @@ os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
 embeddings = HuggingFaceEmbeddings(model_name=MODEL_NAME)
 
 def build_knowledge_base() -> str:
-    return _build_knowledge_base()
+    index_dir = Path(DB_DIR)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    return _build_knowledge_base(index_dir / "manifest.sqlite3")
 
 
 def _build_knowledge_base(manifest_path: Path | None = None) -> str:
