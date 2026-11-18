@@ -23,10 +23,7 @@ class TimedEmbeddings:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Load only knowledge.py, avoiding unrelated imports in tools/__init__.py.
-spec = importlib.util.spec_from_file_location(
-    "knowledge_under_test",
-    PROJECT_ROOT / "tools" / "knowledge.py",
-)
+spec = importlib.util.spec_from_file_location("knowledge_under_test", PROJECT_ROOT / "tools" / "knowledge.py")
 knowledge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(knowledge)
 
@@ -41,11 +38,7 @@ test_docs.mkdir()
 knowledge.KNOWLEDGE_DIR = str(test_docs)
 knowledge.DB_DIR = str(test_root / "chroma_db")
 
-shutil.copytree(
-    PROJECT_ROOT / "workspace" / "knowledge_base",
-    test_docs,
-    dirs_exist_ok=True,
-)
+shutil.copytree(PROJECT_ROOT / "workspace" / "knowledge_base", test_docs, dirs_exist_ok=True)
 print(f"Test workspace: {test_root}")
 
 index_times = []
@@ -53,7 +46,7 @@ index_times = []
 for attempt in range(1, 7):
     timed_embeddings.document_ms = 0.0
     start = perf_counter()
-    result = knowledge.build_knowledge_base()
+    result = knowledge._build_knowledge_base(test_root / "manifest.sqlite3")
     elapsed_ms = (perf_counter() - start) * 1000
     index_times.append(elapsed_ms)
     
@@ -61,6 +54,7 @@ for attempt in range(1, 7):
 
     embedding_ms = timed_embeddings.document_ms
     other_ms = elapsed_ms - embedding_ms
+    
     print(f"  Document embedding: {embedding_ms:.2f} ms")
     print(f"  Other indexing work: {other_ms:.2f} ms")
     print(f"Indexing time: {elapsed_ms:.2f} ms")
