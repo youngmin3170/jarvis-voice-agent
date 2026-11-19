@@ -1,17 +1,20 @@
+import json
 import os
-import docx
-import openpyxl
-from pypdf import PdfReader
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+import docx
+import openpyxl
+from filelock import FileLock
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+
 from indexing.fingerprints import file_sha256
 from indexing.manifest import initialize_manifest
-import json
+
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 PARSER_VERSION = 1
@@ -24,163 +27,276 @@ INDEX_CONFIG = json.dumps(
         "parser_version": PARSER_VERSION,
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
+        "chunk_id_version": 1,
     },
     sort_keys=True,
 )
 
+WORKSPACE_DIR = Path.cwd() / "workspace"
+KNOWLEDGE_DIR = WORKSPACE_DIR / "knowledge_base"
+DB_DIR = Path.cwd() / "chroma_db"
 
-# Base paths
-WORKSPACE_DIR = os.path.abspath(os.path.join(os.getcwd(), "workspace"))
-KNOWLEDGE_DIR = os.path.join(WORKSPACE_DIR, "knowledge_base")
-DB_DIR = os.path.abspath(os.path.join(os.getcwd(), "chroma_db"))
+SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".docx", ".xlsx"}
 
-os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
-
-# Initialize local embedding model
+KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
 embeddings = HuggingFaceEmbeddings(model_name=MODEL_NAME)
 
-def build_knowledge_base() -> str:
-    index_dir = Path(DB_DIR)
-    index_dir.mkdir(parents=True, exist_ok=True)
-    return _build_knowledge_base(index_dir / "manifest.sqlite3")
+
+def _read_text(path: Path) -> str:
+    """Extract the text of one supported document."""
+    extension = path.suffix.lower()
+
+    if extension == ".txt":
+        return path.read_text(encoding="utf-8")
+
+    if extension == ".pdf":
+        with path.open("rb") as stream:
+            reader = PdfReader(stream)
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    pages.append(text)
+            return "\n".join(pages)
+
+    if extension == ".docx":
+        document = docx.Document(path)
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    if extension == ".xlsx":
+        lines = []
+        with closing(openpyxl.load_workbook(path, read_only=True, data_only=True)) as workbook:
+            for sheet in workbook.worksheets:
+                lines.append(f"--- Sheet: {sheet.title} ---")
+
+                for row in sheet.values:
+                    text = " ".join(str(value) for value in row if value is not None)
+                    if text:
+                        lines.append(text)
+
+        return "\n".join(lines)
+
+    raise ValueError(f"Unsupported file type: {extension}")
+
+def _open_store():
+    return Chroma(persist_directory=str(DB_DIR), embedding_function=embeddings)
 
 
-def _build_knowledge_base(manifest_path: Path | None = None) -> str:
+def _replace_chunks(store, relative_path: str, chunks) -> None:
+    """Replace this file's chunks and remove any that no longer exist."""
+    old_ids = store.get(where={"source": relative_path}, include=[])["ids"]
 
-    """
-    Indexes all PDF, TXT, DOCX, and XLSX files in 'workspace/knowledge_base' into the vector database.
-    """
-    print(f"\n[J.A.R.V.I.S. Internal]: Auto-syncing knowledge base from '{KNOWLEDGE_DIR}'...")
-    try:
-        docs = []
-        config = INDEX_CONFIG
+    # Reuse IDs on every edit: notes.txt:0, notes.txt:1, ...
+    new_ids = [f"{relative_path}:{number}" for number in range(len(chunks))]
+
+    if chunks:
+        store.add_documents(chunks, ids=new_ids)
+
+    # Example: the old file had 5 chunks, but the new file has only 3.
+    # IDs 0, 1, 2 were updated above. Delete IDs 3 and 4.
+    obsolete_ids = set(old_ids) - set(new_ids)
+    if obsolete_ids:
+        store.delete(ids=list(obsolete_ids))
+
+
+def _raise_scan_error(error):
+    # A folder that could not be read should not be treated as deleted.
+    raise error
+
+
+def _sync(manifest_path: Path) -> str:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    chroma_file = Path(DB_DIR) / "chroma.sqlite3"
+
+    if chroma_file.exists() and not manifest_path.exists():
+        raise RuntimeError("Existing Chroma index has no matching manifest.")
+
+    initialize_manifest(manifest_path)
+
+    root = Path(KNOWLEDGE_DIR)
+    files = {}
+
+    for folder, _, filenames in os.walk(root, onerror=_raise_scan_error):
+        for filename in filenames:
+            path = Path(folder) / filename
+            if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                relative_path = path.relative_to(root).as_posix()
+                files[relative_path] = path
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+
+    indexed = 0
+    chunk_count = 0
+    skipped = 0
+    deleted = 0
+    failures = []
+
+    with closing(sqlite3.connect(manifest_path)) as db:
+        # A row here means a previous update began but did not finish.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS dirty_files "
+            "(relative_path TEXT PRIMARY KEY)"
+        )
+        db.commit()
+
+        rows = db.execute(
+            "SELECT relative_path, size_bytes, mtime_ns, sha256, index_config "
+            "FROM indexed_files"
+        )
         known = {}
-        pending = []
-        skipped = 0
+        for relative_path, size, mtime, saved_hash, config in rows:
+            known[relative_path] = (size, mtime, saved_hash, config)
 
-        if manifest_path is not None:
-            initialize_manifest(manifest_path)
-            with closing(sqlite3.connect(manifest_path)) as db:
-                rows = db.execute(
-                    "SELECT relative_path, size_bytes, mtime_ns, index_config "
-                    "FROM indexed_files"
-                )
-                known = {path: (size, mtime, cfg) for path, size, mtime, cfg in rows}
+        if known and not chroma_file.exists():
+            raise RuntimeError("Manifest exists, but its Chroma index is missing.")
 
+        dirty = {row[0] for row in db.execute("SELECT relative_path FROM dirty_files")}
 
-        for root, _, files in os.walk(KNOWLEDGE_DIR):
-            for file in files:
-                filepath = os.path.join(root, file)
+        store = _open_store()
 
-                if not file.endswith((".txt", ".pdf", ".docx", ".xlsx")):
-                    print(f"[System Warning]: Unsupported file type skipped: {file}")
-                    continue
+        # Include remembered paths so we can also detect deleted files.
+        all_paths = set(files) | set(known) | dirty
 
-                if manifest_path is not None:
-                    relative = Path(filepath).relative_to(KNOWLEDGE_DIR).as_posix()
-                    stat = os.stat(filepath)
-                    current = (stat.st_size, stat.st_mtime_ns, config)
+        for relative_path in sorted(all_paths):
+            try:
+                path = files.get(relative_path)
+                previous = known.get(relative_path)
 
-                    if known.get(relative) == current:
+                if path is not None:
+                    stat = path.stat()
+                    size = stat.st_size
+                    mtime = stat.st_mtime_ns
+
+                    can_reuse = (previous is not None and relative_path not in dirty and previous[3] == INDEX_CONFIG)
+
+                    # Same size, timestamp, and config: skip without hashing.
+                    if can_reuse and previous[:2] == (size, mtime):
                         skipped += 1
                         continue
 
-                    if relative in known:
-                        raise RuntimeError(f"Changed file needs replacement: {relative}")
+                    current_hash = file_sha256(path)
 
-                    fingerprint = file_sha256(filepath)
-                    docs_before = len(docs)
-                
-                if file.endswith(".txt"):
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        docs.append(Document(page_content=f.read(), metadata={"source": file}))
-                        
-                elif file.endswith(".pdf"):
-                    text = ""
-                    try:
-                        reader = PdfReader(filepath)
-                        for page in reader.pages:
-                            extracted = page.extract_text()
-                            if extracted:
-                                text += extracted + "\n"
-                        docs.append(Document(page_content=text, metadata={"source": file}))
-                    except Exception as e:
-                        print(f"[System Warning]: Could not read PDF {file}: {e}")
+                    # Metadata changed, but the contents are identical.
+                    if can_reuse and previous[2] == current_hash:
+                        with db:
+                            db.execute(
+                                "UPDATE indexed_files "
+                                "SET size_bytes = ?, mtime_ns = ? "
+                                "WHERE relative_path = ?",
+                                (size, mtime, relative_path),
+                            )
+                        skipped += 1
+                        continue
 
-                elif file.endswith(".docx"):
-                    try:
-                        doc = docx.Document(filepath)
-                        text = "\n".join([para.text for para in doc.paragraphs])
-                        docs.append(Document(page_content=text, metadata={"source": file}))
-                    except Exception as e:
-                        print(f"[System Warning]: Could not read DOCX {file}: {e}")
+                # New, changed, deleted, or interrupted. Remember that work is in progress before writing anything to Chroma.
+                with db:
+                    db.execute(
+                        "INSERT OR IGNORE INTO dirty_files (relative_path) "
+                        "VALUES (?)",
+                        (relative_path,),
+                    )
 
-                elif file.endswith(".xlsx"):
-                    try:
-                        wb = openpyxl.load_workbook(filepath, data_only=True)
-                        text = ""
-                        for sheet in wb.worksheets:
-                            text += f"--- Sheet: {sheet.title} ---\n"
-                            for row in sheet.iter_rows(values_only=True):
-                                row_data = " ".join([str(cell) for cell in row if cell is not None])
-                                if row_data:
-                                    text += row_data + "\n"
-                        docs.append(Document(page_content=text, metadata={"source": file}))
-                    except Exception as e:
-                        print(f"[System Warning]: Could not read XLSX {file}: {e}")
+                chunks = []
+                if path is not None:
+                    text = _read_text(path)
+                    document = Document(page_content=text, metadata={"source": relative_path})
+                    chunks = splitter.split_documents([document])
+
+                    if file_sha256(path) != current_hash:
+                        raise RuntimeError("File changed while it was being read.")
+
+                # For a deleted or empty file, an empty list removes its old chunks.
+                _replace_chunks(store, relative_path, chunks)
+
+                # Record success only after the Chroma operation succeeds.
+                with db:
+                    if path is None:
+                        db.execute(
+                            "DELETE FROM indexed_files WHERE relative_path = ?",
+                            (relative_path,),
+                        )
+                        deleted += 1
+                    else:
+                        db.execute(
+                            "INSERT OR REPLACE INTO indexed_files "
+                            "(relative_path, size_bytes, mtime_ns, sha256, index_config) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (relative_path, size, mtime, current_hash, INDEX_CONFIG),
+                        )
+                        indexed += 1
+                        chunk_count += len(chunks)
+
+                    db.execute(
+                        "DELETE FROM dirty_files WHERE relative_path = ?",
+                        (relative_path,),
+                    )
+
+            except Exception as error:
+                with db:
+                    db.execute(
+                        "INSERT OR IGNORE INTO dirty_files (relative_path) "
+                        "VALUES (?)",
+                        (relative_path,),
+                    )
+                failures.append(f"{relative_path}: {error}")
+
+    if failures:
+        raise RuntimeError("Sync incomplete: " + "; ".join(failures))
+
+    return (
+        f"Successfully indexed {indexed} documents ({chunk_count} chunks); "
+        f"skipped {skipped} unchanged; deleted {deleted}."
+    )
 
 
-                if manifest_path is not None and len(docs) > docs_before:
-                    if docs[-1].page_content.strip():
-                        pending.append((relative, stat.st_size, stat.st_mtime_ns, fingerprint, INDEX_CONFIG))
+def _index_lock():
+    index_dir = Path(DB_DIR)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(index_dir / "sync.lock"), timeout=60)
 
-        if not docs:
-            if skipped:
-                return f"Successfully indexed 0 documents; skipped {skipped} unchanged."
-            return "No documents found in knowledge base."
-            
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-        chunks = text_splitter.split_documents(docs)
-        Chroma.from_documents(chunks, embeddings, persist_directory=DB_DIR)
 
-        if manifest_path is not None and pending:
-            with closing(sqlite3.connect(manifest_path)) as db:
-                db.executemany(
-                    "INSERT INTO indexed_files "
-                    "(relative_path, size_bytes, mtime_ns, sha256, index_config) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    pending,
-                )
-                db.commit()
+def build_knowledge_base() -> str:
+    """Sync personal documents into the searchable knowledge base."""
+    return _build_knowledge_base()
 
-        return f"Successfully indexed {len(docs)} documents ({len(chunks)} chunks)."
-    except Exception as e:
-        return f"Failed to build knowledge base: {e}"
+
+def _build_knowledge_base(manifest_path: Path | None = None) -> str:
+    if manifest_path is None:
+        manifest_path = Path(DB_DIR) / "manifest.sqlite3"
+
+    try:
+        with _index_lock():
+            return _sync(manifest_path)
+    except Exception as error:
+        return f"Failed to build knowledge base: {error}"
+
 
 def search_knowledge_base(query: str, auto_sync: bool = True, k: int = 3) -> str:
-    """
-    Searches your personal documents (PDFs, notes, docs, spreadsheets) for relevant information.
-    Automatically syncs and indexes any new documents before searching.
-    
-    Args:
-        query: The specific topic, question, or term to search for in your documents.
-        auto_sync: Whether to automatically refresh the index before searching (default: True).
-        k: The number of most relevant results to return (default: 3).
-    """
-    print(f"\n[J.A.R.V.I.S. Internal]: Accessing knowledge base for '{query}'...")
+    """Search personal documents and return relevant passages with their sources."""
     try:
-        # If DB doesn't exist yet or auto_sync is enabled, index the files first
-        if not os.path.exists(DB_DIR) or auto_sync:
-            build_knowledge_base()
+        with _index_lock():
+            index_dir = Path(DB_DIR)
+            manifest_path = index_dir / "manifest.sqlite3"
 
-        db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
-        results = db.similarity_search(query, k=k)
-        
+            if auto_sync or not manifest_path.exists() or not (index_dir / "chroma.sqlite3").exists():
+                _sync(manifest_path)
+            else:
+                with closing(sqlite3.connect(manifest_path)) as db:
+                    unfinished = db.execute(
+                        "SELECT 1 FROM dirty_files LIMIT 1"
+                    ).fetchone()
+                    if unfinished:
+                        raise RuntimeError("An index update is incomplete. Run sync again.")
+
+            results = _open_store().similarity_search(query, k=k)
+
         if not results:
             return "No relevant information found in the documents."
-            
-        extracted_info = [f"Source: {res.metadata.get('source', 'Unknown')}\nContent:\n{res.page_content}" for res in results]
-        return "\n\n---\n\n".join(extracted_info)
-        
-    except Exception as e:
-        return f"Knowledge base search failed: {e}"
+
+        return "\n\n---\n\n".join(
+            f"Source: {result.metadata['source']}\nContent:\n{result.page_content}"
+            for result in results
+        )
+
+    except Exception as error:
+        return f"Knowledge base search failed: {error}"
